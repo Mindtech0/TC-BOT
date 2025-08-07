@@ -1,6 +1,0 @@
-module.exports = {
-  name: "ping",
-  run: async (client, msg, args) => {
-    await msg.reply("🏓 Pong!");
-  }
-};
