@@ -1,0 +1,189 @@
+const fs           = require('fs');
+const path         = require('path');
+const express      = require('express');
+const axios        = require('axios');
+const { v4: uuid } = require('uuid');
+const cooldowns    = new Map();
+
+// Load or init persistent storage
+const DATA_PATH = path.resolve(__dirname, '../data/send_data.json');
+let store = { templates: {}, optOut: [], reports: [] };
+if (fs.existsSync(DATA_PATH)) store = JSON.parse(fs.readFileSync(DATA_PATH));
+
+// Simple Express app for analytics
+const analyticsApp = express();
+analyticsApp.get('/analytics', (req, res) => {
+  res.json(store.reports);
+});
+analyticsApp.listen(3001, () => console.log('[Analytics] Listening on :3001'));
+
+module.exports = {
+  name: "send",
+  description: "Powerful broadcast with media, tokens, scheduling, templates, opt-out, follow-up, analytics…",
+  category: "owner",
+  
+  /**
+   * args: Array of strings, full raw command split on spaces
+   * sock: Baileys sock
+   * m: incoming message
+   * db: your database instance
+   */
+  async execute(sock, m, args, db) {
+    const senderId = m.sender;
+    const botOwner = sock.user.id.split(":")[0] + "@s.whatsapp.net";
+    if (senderId !== botOwner) {
+      return sock.sendMessage(m.chat, { text: "🚫 Owner only." });
+    }
+
+    // Parse flags
+    const flags = args.filter(a => a.startsWith('--')).map(f => f.slice(2));
+    const scheduledFlag = flags.find(f => f.startsWith('at='));
+    const isSchedule    = !!scheduledFlag;
+    const sendTime      = isSchedule ? new Date(scheduledFlag.split('=')[1]) : null;
+    const multiNames    = args.join(' ').split('|')[0].split(',').map(g => g.trim());
+    let messageTemplate = args.join(' ').split('|')[1] || '';
+    const mediaFlag     = flags.find(f => f.startsWith('media='));
+    const media         = mediaFlag ? mediaFlag.split('=')[1] : null;
+    const confirmNeeded = multiNames.length * 1 > 50; // if >50 total groups, ask confirm
+
+    // Confirmation Flow
+    if (confirmNeeded && !store.pendingConfirm) {
+      store.pendingConfirm = { id: senderId, groups: multiNames, msg: messageTemplate };
+      fs.writeFileSync(DATA_PATH, JSON.stringify(store, null,2));
+      return sock.sendMessage(m.chat, { text: `⚠️ You're about to send to ${multiNames.length} groups. Reply YES to proceed or NO to cancel.` });
+    }
+    if (store.pendingConfirm && m.text.toLowerCase() === 'no') {
+      delete store.pendingConfirm;
+      fs.writeFileSync(DATA_PATH, JSON.stringify(store,null,2));
+      return sock.sendMessage(m.chat, { text: "❌ Broadcast cancelled." });
+    }
+    if (store.pendingConfirm && m.text.toLowerCase() === 'yes') {
+      // restore saved
+      const cfg = store.pendingConfirm;
+      multiNames.length = 0;
+      multiNames.push(...cfg.groups);
+      messageTemplate  = cfg.msg;
+      delete store.pendingConfirm;
+      fs.writeFileSync(DATA_PATH, JSON.stringify(store,null,2));
+    }
+
+    // Scheduling
+    if (isSchedule && sendTime > Date.now()) {
+      const jobId = uuid();
+      db.scheduleJob({
+        id: jobId,
+        runAt: sendTime,
+        command: 'send',
+        args: args.join(' ')
+      });
+      return sock.sendMessage(m.chat, { text: `⏰ Scheduled at ${sendTime}` });
+    }
+
+    // Cooldown
+    const cdTime = 60*1000;
+    if (cooldowns.has(senderId) && cooldowns.get(senderId) > Date.now()) {
+      const rem = ((cooldowns.get(senderId)-Date.now())/1000).toFixed(1);
+      return sock.sendMessage(m.chat, { text: `⏳ Wait ${rem}s` });
+    }
+    cooldowns.set(senderId, Date.now()+cdTime);
+
+    // Handle multi-group
+    let totalSent=0, totalFail=0, startAll=Date.now();
+    for (const groupName of multiNames) {
+      // find group
+      const all = await sock.groupFetchAllParticipating();
+      const grp = Object.values(all).find(g=>g.subject.toLowerCase()===groupName.toLowerCase());
+      if (!grp) continue;
+      const meta   = await sock.groupMetadata(grp.id);
+      const admins = meta.participants.filter(p=>p.admin).map(p=>p.id);
+      const members= meta.participants.map(p=>p.id).filter(id=>id!==senderId && !admins.includes(id));
+
+      // Template & tokens
+      const tokens = {
+        '{{group}}': grp.subject,
+        '{{total}}': members.length,
+      };
+      // extend with personalization inside loop
+
+      // Loop members
+      for (const userId of members) {
+        if (store.optOut.includes(userId)) continue;
+        let text = messageTemplate || store.templates['default'] || 'Hello {{name}}!';
+        // fetch profile name
+        const p = await sock.onWhatsApp(userId);
+        let first = p[0]?.notify?.split(' ')[0] || '';
+        text = text.replace(/{{first_name}}/g, first)
+                   .replace(/{{group}}/g, grp.subject)
+                   .replace(/{{total}}/g, members.length);
+
+        const sendOpts = { text };
+        if (media) {
+          sendOpts[ media.match(/\.(jpg|png|gif)$/) ? 'image' : 'video' ] = { url: media, caption: text };
+        }
+
+        try {
+          await retrySend(() => sock.sendMessage(userId, sendOpts), 3, 1000);
+          totalSent++;
+        } catch {
+          totalFail++;
+        }
+      }
+    }
+    const elapsed = ((Date.now()-startAll)/1000).toFixed(1);
+
+    // Build report
+    const report = { id: uuid(), when: new Date(), sent: totalSent, failed: totalFail, time: elapsed };
+    store.reports.push(report);
+    fs.writeFileSync(DATA_PATH, JSON.stringify(store,null,2));
+
+// Continue from previous...
+    // Final summary
+    await sock.sendMessage(m.chat, {
+      text: `✅ Broadcast complete!
+🕒 Took: ${elapsed}s
+📤 Sent: ${totalSent}
+❌ Failed: ${totalFail}`
+    });
+
+    // FOLLOW-UP DRIP
+    // Schedule a 24h follow-up to anyone who didn’t reply
+    const followId = uuid();
+    db.scheduleJob({
+      id: followId,
+      runAt: Date.now() + 24*60*60*1000,
+      task: async () => {
+        for (const r of store.reports.filter(r=>r.id===report.id)) {
+          // fetch who replied (db.getReplies(report.id))
+          const nonResp = await db.getNonResponders(report.id);
+          for (const u of nonResp) {
+            await sock.sendMessage(u, { text: "👋 Just checking in—did you see my earlier message?" });
+          }
+        }
+      }
+    });
+  }
+};
+
+// ======== Helper: Retry logic ========
+async function retrySend(fn, attempts, delay) {
+  for (let i = 0; i < attempts; i++) {
+    try { return await fn(); }
+    catch (e) {
+      if (i === attempts - 1) throw e;
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+}
+
+// ======== Template Management (examples) ========
+module.exports.saveTemplate = (name, content) => {
+  store.templates[name] = content;
+  fs.writeFileSync(DATA_PATH, JSON.stringify(store, null,2));
+};
+
+module.exports.optOutUser = (userId) => {
+  if (!store.optOut.includes(userId)) {
+    store.optOut.push(userId);
+    fs.writeFileSync(DATA_PATH, JSON.stringify(store, null,2));
+  }
+};
