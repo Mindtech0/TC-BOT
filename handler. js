@@ -1,0 +1,26 @@
+const fs = require('fs');
+const path = require('path');
+const { PREFIX } = require('./config');
+
+module.exports = (sock) => {
+  const commandFiles = fs.readdirSync('./commands').filter(file => file.endsWith('.js'));
+
+  for (const file of commandFiles) {
+    const command = require(`./commands/${file}`);
+
+    sock.ev.on('messages.upsert', async ({ messages }) => {
+      const msg = messages[0];
+      if (!msg?.message) return;
+
+      const body = msg.message.conversation || msg.message.extendedTextMessage?.text;
+      if (!body || !body.startsWith(PREFIX)) return;
+
+      const args = body.slice(PREFIX.length).trim().split(/ +/);
+      const cmdName = args.shift().toLowerCase();
+
+      if (cmdName === command.name) {
+        await command.run(sock, msg, args);
+      }
+    });
+  }
+};
